@@ -1,4 +1,5 @@
 pandas
+scipy
 requests
 ratelimit
 tqdm
