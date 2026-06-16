@@ -1,5 +1,6 @@
 pandas
 scipy
+scikit-learn
 requests
 ratelimit
 tqdm

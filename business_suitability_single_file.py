@@ -18,9 +18,11 @@ import csv
 import json
 import math
 import os
+import pickle
 import random
 import statistics
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -50,7 +52,40 @@ except Exception:
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "google/flan-t5-base"
+SCORING_MODEL_PATH = HERE / "models" / "scoring_model.pkl"
 _reasoner = None
+
+
+@dataclass(frozen=True)
+class ScoringConfig:
+    """Documented defaults for the hand-tuned market viability rubric."""
+
+    rating_cutoffs: tuple[float, float, float] = (4.5, 4.0, 3.5)
+    rating_points: tuple[int, int, int] = (3, 2, 1)
+    review_cutoffs: tuple[int, int, int] = (2000, 700, 150)
+    review_points: tuple[int, int, int] = (3, 2, 1)
+    low_competitor_threshold: int = 2
+    moderate_competitor_threshold: int = 5
+    low_competition_points: int = 2
+    moderate_competition_points: int = 1
+    high_competition_points: int = -1
+    weak_competitor_rating: float = 3.9
+    strong_competitor_rating: float = 4.3
+    weak_competitor_points: int = 1
+    strong_competitor_points: int = -1
+    highly_suitable_threshold: float = 7.0
+    moderately_suitable_threshold: float = 4.0
+    weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "rating": 1.0,
+            "reviews": 1.0,
+            "competition": 1.0,
+            "competitor_quality": 1.0,
+        }
+    )
+
+
+DEFAULT_SCORING_CONFIG = ScoringConfig()
 
 DEFAULT_SCORE_WEIGHTS = {
     "rating": 1.0,
@@ -86,12 +121,31 @@ def set_seed(seed):
 
 
 def merge_score_weights(weights=None):
-    merged = dict(DEFAULT_SCORE_WEIGHTS)
+    merged = dict(DEFAULT_SCORING_CONFIG.weights)
     if weights:
         for key, value in weights.items():
             if key in merged and value is not None:
                 merged[key] = float(value)
     return merged
+
+
+def build_model_features(rating, reviews, competitor_count, avg_comp_rating) -> list[float]:
+    """Return the numeric feature vector used by the optional trained scorer."""
+    return [
+        0.0 if rating is None else float(rating),
+        0.0 if reviews is None else float(reviews),
+        0.0 if competitor_count is None else float(competitor_count),
+        0.0 if avg_comp_rating is None else float(avg_comp_rating),
+    ]
+
+
+def load_scoring_model(model_path: Path | str = SCORING_MODEL_PATH):
+    """Load the optional trained scoring model if it exists."""
+    path = Path(model_path)
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def get_reasoner():
@@ -229,7 +283,32 @@ def haversine_km(lat1, lon1, lat2, lon2):
 # ---------------------------
 # Scoring (adjustable)
 # ---------------------------
-def compute_business_score(rating, reviews, competitor_count, avg_comp_rating, weights=None):
+def label_for_score(score, config: ScoringConfig = DEFAULT_SCORING_CONFIG):
+    """Map a 0-10 suitability score to the existing label scale."""
+    if score >= config.highly_suitable_threshold:
+        return "Highly suitable"
+    if score >= config.moderately_suitable_threshold:
+        return "Moderately suitable"
+    return "Not recommended"
+
+
+def _score_from_cutoffs(value, cutoffs, points):
+    for cutoff, point in zip(cutoffs, points):
+        if value >= cutoff:
+            return point
+    return 0
+
+
+def compute_business_score(
+    rating,
+    reviews,
+    competitor_count,
+    avg_comp_rating,
+    weights=None,
+    config: ScoringConfig = DEFAULT_SCORING_CONFIG,
+    use_trained_model: bool = True,
+    model_path: Path | str = SCORING_MODEL_PATH,
+):
     """
     Formal parameterization of the business suitability score.
 
@@ -251,23 +330,38 @@ def compute_business_score(rating, reviews, competitor_count, avg_comp_rating, w
     - phi_c(c): 2/1/-1 for competitor_count <= 2 / <= 5 / otherwise
     - phi_q(q): 1/-1/0 for avg competitor rating < 3.9 / >= 4.3 / otherwise
 
-    The default weight vector preserves the existing scoring behavior.
+    If `models/scoring_model.pkl` exists and `use_trained_model=True`, the fitted logistic
+    model is used instead and its predicted probability is scaled to the 0-10 score range.
+    Otherwise the default weight vector preserves the existing scoring behavior.
     """
+    if use_trained_model:
+        model = load_scoring_model(model_path)
+        if model is not None:
+            features = [build_model_features(rating, reviews, competitor_count, avg_comp_rating)]
+            probability = float(model.predict_proba(features)[0][1])
+            score = round(probability * 10.0, 4)
+            return score, label_for_score(score, config)
+
     weights = merge_score_weights(weights)
     rating = 0.0 if rating is None else float(rating)
     reviews = 0 if reviews is None else int(reviews)
     competitor_count = 0 if competitor_count is None else int(competitor_count)
     avg_comp_rating = 0.0 if avg_comp_rating is None else float(avg_comp_rating)
 
-    rating_term = 3 if rating >= 4.5 else 2 if rating >= 4.0 else 1 if rating >= 3.5 else 0
-    review_term = 3 if reviews >= 2000 else 2 if reviews >= 700 else 1 if reviews >= 150 else 0
-    competition_term = 2 if competitor_count <= 2 else 1 if competitor_count <= 5 else -1
+    rating_term = _score_from_cutoffs(rating, config.rating_cutoffs, config.rating_points)
+    review_term = _score_from_cutoffs(reviews, config.review_cutoffs, config.review_points)
+    if competitor_count <= config.low_competitor_threshold:
+        competition_term = config.low_competition_points
+    elif competitor_count <= config.moderate_competitor_threshold:
+        competition_term = config.moderate_competition_points
+    else:
+        competition_term = config.high_competition_points
     quality_term = 0
     if competitor_count > 0:
-        if avg_comp_rating < 3.9:
-            quality_term = 1
-        elif avg_comp_rating >= 4.3:
-            quality_term = -1
+        if avg_comp_rating < config.weak_competitor_rating:
+            quality_term = config.weak_competitor_points
+        elif avg_comp_rating >= config.strong_competitor_rating:
+            quality_term = config.strong_competitor_points
 
     score = (
         weights["rating"] * rating_term
@@ -276,12 +370,7 @@ def compute_business_score(rating, reviews, competitor_count, avg_comp_rating, w
         + weights["competitor_quality"] * quality_term
     )
     score = max(0.0, round(float(score), 4))
-    if score >= DEFAULT_LABEL_THRESHOLDS["highly"]:
-        label = "Highly suitable"
-    elif score >= DEFAULT_LABEL_THRESHOLDS["moderately"]:
-        label = "Moderately suitable"
-    else:
-        label = "Not recommended"
+    label = label_for_score(score, config)
     return score, label
 
 

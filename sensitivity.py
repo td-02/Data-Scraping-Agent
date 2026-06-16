@@ -56,6 +56,7 @@ def run_sensitivity_analysis(results, weights=None, run_id=None, export_path=Non
                 row.get("competitor_count"),
                 row.get("avg_comp_rating"),
                 weights=scenario_weights,
+                use_trained_model=False,
             )
             rows.append(
                 {
