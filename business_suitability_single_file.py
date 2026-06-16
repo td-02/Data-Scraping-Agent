@@ -540,6 +540,15 @@ def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, 
 
     print(f"\nSpatial Moran's I approximation: {morans_i}")
     print("Per-business competitor HHI computed and added to the CSV output.")
+    try:
+        from spatial import analyze_spatial_clusters
+
+        spatial_analysis = analyze_spatial_clusters(results, local_radius_m=local_radius_m, moran_i=morans_i)
+    except Exception as e:
+        spatial_analysis = {"moran_i": morans_i, "error": str(e)}
+
+    print("\nSpatial cluster analysis:")
+    print(json.dumps(spatial_analysis, indent=2, default=str))
 
     manifest_config = {
         "query": query,
@@ -550,7 +559,7 @@ def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, 
         "timestamp": run_id,
         "model_name": MODEL_NAME,
         "output_csv": None,
-        "moran_i_approx": morans_i,
+        "spatial_analysis": spatial_analysis,
         "competitor_hhi_definition": "sum of squared shares of rounded competitor ratings to 1 decimal place",
     }
 
