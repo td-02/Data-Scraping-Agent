@@ -37,8 +37,8 @@ from tqdm import tqdm
 HERE = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=HERE / ".env")
 
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 DOWNLOADS = Path.home() / "Downloads"
 try:
@@ -51,9 +51,9 @@ except Exception:
     DOWNLOADS = HERE / "outputs"
     DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
-MODEL_NAME = "google/flan-t5-base"
+DETERMINISTIC_VERDICT_MODEL_NAME = "deterministic-verdict-v1"
+ANTHROPIC_MODEL_NAME = os.getenv("ANTHROPIC_MODEL_NAME", "claude-3-5-haiku-20241022")
 SCORING_MODEL_PATH = HERE / "models" / "scoring_model.pkl"
-_reasoner = None
 
 
 @dataclass(frozen=True)
@@ -147,28 +147,6 @@ def load_scoring_model(model_path: Path | str = SCORING_MODEL_PATH):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-
-def get_reasoner():
-    global _reasoner
-    if _reasoner is not None:
-        return _reasoner
-
-    try:
-        from transformers import pipeline
-    except Exception as e:
-        raise RuntimeError("Install transformers + torch: pip install transformers torch") from e
-
-    print("Initializing LLM (may download first run)...")
-    hf_kwargs = {}
-    if HF_API_TOKEN:
-        hf_kwargs["token"] = HF_API_TOKEN
-    try:
-        _reasoner = pipeline("text2text-generation", model=MODEL_NAME, **hf_kwargs)
-    except Exception as e:
-        print("Warning: model init with token failed; trying without token...", e)
-        _reasoner = pipeline("text2text-generation", model=MODEL_NAME)
-    print("LLM ready (CPU)")
-    return _reasoner
 
 # ---------------------------
 # HTTP helpers
@@ -419,40 +397,74 @@ def compute_competitor_hhi(local_comps):
     return round(sum((count / total) ** 2 for count in counts.values()), 4)
 
 # ---------------------------
-# LLM reasoner prompt (improved)
+# Verdict generation
 # ---------------------------
-def build_reasoner_prompt(name, query_location, score_label, score, local_comps):
-    comp_lines = ""
-    for c in local_comps[:8]:
-        comp_lines += f"- {c['name']} (rating: {c['rating']}, reviews: {c['user_ratings_total']})\n"
-    if not comp_lines:
-        comp_lines = "None listed.\n"
-    prompt = f"""You are a concise local business consultant.
+def generate_verdict(name, rating, score, label, competitor_count, avg_comp_rating, local_radius_m):
+    """Generate a deterministic suitability verdict from structured scoring fields."""
+    density = "Low" if competitor_count <= 2 else "Moderate" if competitor_count <= 5 else "High"
+    rating_signal = "strong" if (rating or 0.0) >= 4.3 else "adequate" if (rating or 0.0) >= 3.8 else "weak"
+    competitor_signal = (
+        "weak competitor quality"
+        if competitor_count and avg_comp_rating < 3.9
+        else "strong competitor quality"
+        if competitor_count and avg_comp_rating >= 4.3
+        else "mixed competitor quality"
+        if competitor_count
+        else "no local competitor signal"
+    )
+    action = (
+        "Recommend market entry."
+        if label == "Highly suitable"
+        else "Consider entry with local validation."
+        if label == "Moderately suitable"
+        else "Do not prioritize market entry without stronger evidence."
+    )
+    return (
+        f"Score: {score}/10 ({label}). "
+        f"{density} competitor density ({competitor_count} within {local_radius_m}m), "
+        f"{rating_signal} rating signal ({rating or 0.0}), {competitor_signal} "
+        f"(avg {avg_comp_rating}). {action}"
+    )
 
-Business name: {name}
-Location (user query): {query_location}
-Preliminary score: {score_label} (score {score}/10)
 
-Nearby competitors (within chosen radius):
-{comp_lines}
+def reason_with_anthropic(payload):
+    """Generate an optional LLM verdict from structured inputs using Anthropic."""
+    if not ANTHROPIC_API_KEY:
+        return "LLM verdict unavailable: ANTHROPIC_API_KEY missing."
 
-Task: Based on the info above, in 5-8 short lines:
-1) One-line verdict: Recommended / Not recommended / Consider with caveats.
-2) 3 short pros.
-3) 3 short cons/risks.
-4) 3 practical next steps (what the owner should check or do next).
-
-Keep output brief, numbered, action-oriented.
-"""
-    return prompt
-
-def reason_with_llm(name, query_location, score_label, score, local_comps):
-    prompt = build_reasoner_prompt(name, query_location, score_label, score, local_comps)
+    body = {
+        "model": ANTHROPIC_MODEL_NAME,
+        "max_tokens": 220,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Return a concise local market-entry verdict from this JSON. "
+                            "Use 3 sentences maximum and do not invent unavailable facts.\n"
+                            f"{json.dumps(payload, sort_keys=True, default=str)}"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+    }
     try:
-        out = get_reasoner()(prompt, max_length=280, do_sample=False)
-        first = out[0]
-        text = first.get("generated_text") or first.get("text") or str(first)
-        return text.strip()
+        response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+        content = data.get("content", [])
+        if content and isinstance(content[0], dict):
+            return str(content[0].get("text", "")).strip()
+        return str(data).strip()
     except Exception as e:
         return f"LLM error: {e}"
 
@@ -491,7 +503,7 @@ def export_results(rows, prefix="suitability_results", run_id=None, manifest_con
 # ---------------------------
 # Main evaluation pipeline
 # ---------------------------
-def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, run_analyses=True):
+def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, run_analyses=True, use_llm=False):
     set_seed(seed)
     weights = merge_score_weights(weights)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -523,7 +535,30 @@ def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, 
             avg_comp_rating,
             weights=weights,
         )
-        verdict = reason_with_llm(place["name"], query, label, score, local_comps)
+        verdict_payload = {
+            "business_name": place["name"],
+            "query": query,
+            "rating": place["rating"],
+            "review_count": place["user_ratings_total"],
+            "score": score,
+            "label": label,
+            "competitor_count": comp_count,
+            "avg_competitor_rating": avg_comp_rating,
+            "local_radius_m": local_radius_m,
+        }
+        verdict = (
+            reason_with_anthropic(verdict_payload)
+            if use_llm
+            else generate_verdict(
+                place["name"],
+                place["rating"],
+                score,
+                label,
+                comp_count,
+                avg_comp_rating,
+                local_radius_m,
+            )
+        )
         competitor_hhi = compute_competitor_hhi(local_comps)
         row = {
             "name": place["name"], "types": place["types"], "rating": place["rating"],
@@ -557,7 +592,8 @@ def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, 
         "weights": weights,
         "seed": seed,
         "timestamp": run_id,
-        "model_name": MODEL_NAME,
+        "model_name": ANTHROPIC_MODEL_NAME if use_llm else DETERMINISTIC_VERDICT_MODEL_NAME,
+        "llm_enabled": use_llm,
         "output_csv": None,
         "spatial_analysis": spatial_analysis,
         "competitor_hhi_definition": "sum of squared shares of rounded competitor ratings to 1 decimal place",
@@ -582,7 +618,7 @@ def evaluate_query(query, pages=2, local_radius_m=500, weights=None, seed=None, 
                 "weights": weights,
                 "seed": seed,
                 "timestamp": run_id,
-                "model_name": MODEL_NAME,
+                "model_name": ANTHROPIC_MODEL_NAME if use_llm else DETERMINISTIC_VERDICT_MODEL_NAME,
                 "output_csv": str(sensitivity_out),
                 "source_csv": str(out),
                 "analysis_type": "sensitivity",
@@ -607,6 +643,7 @@ def main():
     print("=== Business Suitability Hybrid Agent (Improved) ===")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--llm", action="store_true", help="Use Anthropic for optional LLM verdicts")
     args, _ = parser.parse_known_args()
 
     set_seed(args.seed)
@@ -621,7 +658,7 @@ def main():
     rad_in = input("Local radius in meters for 'local competitors' (default 500): ").strip()
     try: rad = max(100, min(2000, int(rad_in))) 
     except: rad = 500
-    results = evaluate_query(q, pages=pages, local_radius_m=rad, seed=args.seed)
+    results = evaluate_query(q, pages=pages, local_radius_m=rad, seed=args.seed, use_llm=args.llm)
     if results:
         print("\nTop 5 results:")
         for r in results[:5]:
